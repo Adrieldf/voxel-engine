@@ -1,0 +1,97 @@
+# ====================================================================
+# Modern C++ and CMake GitIgnore Configuration for Voxel Engine
+# ====================================================================
+
+# Prerequisites & Compilers
+*.d
+*.i
+*.s
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic & Static libraries
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+*.exp
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# ====================================================================
+# Build Systems (CMake / MSBuild / Make)
+# ====================================================================
+# Ignore the generated build directory
+build/
+bin/
+out/
+[Db]/
+
+# CMake intermediate files
+CMakeCache.txt
+CMakeFiles/
+CMakeSettings.json
+CMakeUserPresets.json
+CTestTestfile.cmake
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+
+# ====================================================================
+# IDEs and Editors
+# ====================================================================
+# Visual Studio
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.vc.db
+*.ipch
+*.tlog
+*.ilk
+*.pdb
+*.idb
+
+# Visual Studio Code
+.vscode/
+.history/
+*.code-workspace
+
+# CLion / IntelliJ
+.idea/
+cmake-build-*/
+
+# ====================================================================
+# OS-Specific and Temporary Files
+# ====================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.log
+*.tmp
+*.temp
