@@ -60,6 +60,10 @@ public:
     std::atomic<bool> isMeshQueued{false};
     std::atomic<bool> isMeshReadyCPU{false};
     std::atomic<bool> isMeshUploaded{false};
+    std::atomic<int> lodScale{1};
+    float fadeProgress{0.0f};
+    bool hasFadedIn{false};
+    std::atomic<bool> needsReupload{false};
     
     struct SubMesh {
         std::vector<uint32_t> packedVertices;
@@ -82,50 +86,49 @@ public:
         bool is_active_pos[512];
         uint16_t count_neg = 0;
         uint16_t count_pos = 0;
-    } mBuf;
+    };
 
     Chunk(int cx, int cz) : pos{cx, cz} {
         std::fill(blocks, blocks + CHUNK_SIZE, BLOCK_AIR);
-        model.meshCount = 0;
-        model.meshes = nullptr;
-        model.materials = nullptr;
-        model.meshMaterial = nullptr;
-        model.materialCount = 0;
-        modelTransparent.meshCount = 0;
-        modelTransparent.meshes = nullptr;
-        modelTransparent.materials = nullptr;
-        modelTransparent.meshMaterial = nullptr;
-        modelTransparent.materialCount = 0;
-        std::fill(&mBuf.is_active_neg[0], &mBuf.is_active_neg[512], false);
-        std::fill(&mBuf.is_active_pos[0], &mBuf.is_active_pos[512], false);
-        std::memset(mBuf.masks_neg, 0, sizeof(mBuf.masks_neg));
-        std::memset(mBuf.masks_pos, 0, sizeof(mBuf.masks_pos));
+        std::memset(&model, 0, sizeof(Model));
+        std::memset(&modelTransparent, 0, sizeof(Model));
         subMeshes.reserve(4);
         subMeshesTransparent.reserve(4);
     }
 
     ~Chunk() {
-        unloadGPU();
+        // GPU resources must be unloaded strictly on the main thread before the chunk is destroyed.
+        // We explicitly do this in World::clearWorld() and World::update() (amortized garbage collection)
+        // to prevent executing OpenGL/Raylib resource deletions inside background worker thread destructors.
     }
 
     void unloadGPU() {
+        TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) starting unloadGPU (isMeshUploaded: %d)...", pos.x, pos.z, isMeshUploaded.load());
+        std::lock_guard<std::mutex> lock(meshMutex);
         if (isMeshUploaded) {
-            UnloadModel(model);
+            if (model.meshCount > 0) {
+                if (model.materials != nullptr) {
+                    for (int i = 0; i < model.materialCount; ++i) {
+                        model.materials[i].shader.id = rlGetShaderIdDefault();
+                    }
+                }
+                TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) unloading model meshes: %d", pos.x, pos.z, model.meshCount);
+                UnloadModel(model);
+            }
             if (modelTransparent.meshCount > 0) {
+                if (modelTransparent.materials != nullptr) {
+                    for (int i = 0; i < modelTransparent.materialCount; ++i) {
+                        modelTransparent.materials[i].shader.id = rlGetShaderIdDefault();
+                    }
+                }
+                TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) unloading modelTransparent meshes: %d", pos.x, pos.z, modelTransparent.meshCount);
                 UnloadModel(modelTransparent);
             }
             isMeshUploaded = false;
-            model.meshCount = 0;
-            model.meshes = nullptr;
-            model.materials = nullptr;
-            model.meshMaterial = nullptr;
-            model.materialCount = 0;
-            modelTransparent.meshCount = 0;
-            modelTransparent.meshes = nullptr;
-            modelTransparent.materials = nullptr;
-            modelTransparent.meshMaterial = nullptr;
-            modelTransparent.materialCount = 0;
+            std::memset(&model, 0, sizeof(Model));
+            std::memset(&modelTransparent, 0, sizeof(Model));
         }
+        TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) finished unloadGPU successfully.", pos.x, pos.z);
     }
 
     inline int getIndex(int x, int y, int z) const {
@@ -136,13 +139,106 @@ public:
         if (x < 0 || x >= CHUNK_WIDTH || y < 0 || y >= CHUNK_HEIGHT || z < 0 || z >= CHUNK_DEPTH) {
             return BLOCK_AIR;
         }
-        return blocks[getIndex(x, y, z)];
+        BlockType type = blocks[getIndex(x, y, z)];
+        if (type >= BLOCK_COUNT) return BLOCK_AIR;
+        return type;
     }
 
     void setBlock(int x, int y, int z, BlockType type) {
         if (x >= 0 && x < CHUNK_WIDTH && y >= 0 && y < CHUNK_HEIGHT && z >= 0 && z < CHUNK_DEPTH) {
             blocks[getIndex(x, y, z)] = type;
         }
+    }
+
+    BlockType getLODBlock(int vx, int vy, int vz, int scale) const {
+        if (scale <= 1) {
+            return getBlock(vx, vy, vz);
+        }
+        
+        int x_start = vx * scale;
+        int y_start = vy * scale;
+        int z_start = vz * scale;
+        
+        int counts[16] = {0};
+        int maxCount = 0;
+        BlockType dominantType = BLOCK_AIR;
+        
+        for (int dy = 0; dy < scale; ++dy) {
+            for (int dx = 0; dx < scale; ++dx) {
+                for (int dz = 0; dz < scale; ++dz) {
+                    BlockType type = getBlock(x_start + dx, y_start + dy, z_start + dz);
+                    if (type > BLOCK_AIR && type < BLOCK_COUNT) {
+                        counts[type]++;
+                        if (counts[type] > maxCount) {
+                            maxCount = counts[type];
+                            dominantType = type;
+                        }
+                    }
+                }
+            }
+        }
+        return dominantType;
+    }
+
+    inline uint16_t getLODVoxel(int vx, int vy, int vz, int scale,
+                                const Chunk* neighborXNeg, const Chunk* neighborXPos,
+                                const Chunk* neighborZNeg, const Chunk* neighborZPos,
+                                const Chunk* neighborXNegZNeg, const Chunk* neighborXNegZPos,
+                                const Chunk* neighborXPosZNeg, const Chunk* neighborXPosZPos) const 
+    {
+        if (scale <= 1) {
+            return getVoxel(vx, vy, vz, neighborXNeg, neighborXPos, neighborZNeg, neighborZPos,
+                            neighborXNegZNeg, neighborXNegZPos, neighborXPosZNeg, neighborXPosZPos);
+        }
+
+        int rx = vx * scale;
+        int ry = vy * scale;
+        int rz = vz * scale;
+
+        if (ry < 0 || ry >= CHUNK_HEIGHT) return BLOCK_AIR;
+
+        if (rx < 0 || rx >= CHUNK_WIDTH || rz < 0 || rz >= CHUNK_DEPTH) {
+            const Chunk* targetNeighbor = nullptr;
+            int nx = rx;
+            int nz = rz;
+
+            if (rx < 0) {
+                nx += CHUNK_WIDTH;
+                if (rz < 0) {
+                    targetNeighbor = neighborXNegZNeg;
+                    nz += CHUNK_DEPTH;
+                } else if (rz >= CHUNK_DEPTH) {
+                    targetNeighbor = neighborXNegZPos;
+                    nz -= CHUNK_DEPTH;
+                } else {
+                    targetNeighbor = neighborXNeg;
+                }
+            } else if (rx >= CHUNK_WIDTH) {
+                nx -= CHUNK_WIDTH;
+                if (rz < 0) {
+                    targetNeighbor = neighborXPosZNeg;
+                    nz += CHUNK_DEPTH;
+                } else if (rz >= CHUNK_DEPTH) {
+                    targetNeighbor = neighborXPosZPos;
+                    nz -= CHUNK_DEPTH;
+                } else {
+                    targetNeighbor = neighborXPos;
+                }
+            } else {
+                if (rz < 0) {
+                    targetNeighbor = neighborZNeg;
+                    nz += CHUNK_DEPTH;
+                } else if (rz >= CHUNK_DEPTH) {
+                    targetNeighbor = neighborZPos;
+                    nz -= CHUNK_DEPTH;
+                }
+            }
+
+            if (!targetNeighbor) return BLOCK_AIR;
+            return targetNeighbor->getLODBlock(nx / scale, ry / scale, nz / scale, scale);
+        }
+
+        return getLODBlock(vx, vy, vz, scale);
     }
 
     inline uint16_t getVoxel(int x, int y, int z,
@@ -155,30 +251,30 @@ public:
 
         if (x < 0) {
             if (z < 0) {
-                return neighborXNegZNeg ? neighborXNegZNeg->blocks[31 + (31 * 32) + (y * 1024)] : BLOCK_AIR;
+                return neighborXNegZNeg ? neighborXNegZNeg->getBlock(31, y, 31) : BLOCK_AIR;
             }
             if (z >= CHUNK_DEPTH) {
-                return neighborXNegZPos ? neighborXNegZPos->blocks[31 + (0 * 32) + (y * 1024)] : BLOCK_AIR;
+                return neighborXNegZPos ? neighborXNegZPos->getBlock(31, y, 0) : BLOCK_AIR;
             }
-            return neighborXNeg ? neighborXNeg->blocks[31 + (z * 32) + (y * 1024)] : BLOCK_AIR;
+            return neighborXNeg ? neighborXNeg->getBlock(31, y, z) : BLOCK_AIR;
         }
         if (x >= CHUNK_WIDTH) {
             if (z < 0) {
-                return neighborXPosZNeg ? neighborXPosZNeg->blocks[0 + (31 * 32) + (y * 1024)] : BLOCK_AIR;
+                return neighborXPosZNeg ? neighborXPosZNeg->getBlock(0, y, 31) : BLOCK_AIR;
             }
             if (z >= CHUNK_DEPTH) {
-                return neighborXPosZPos ? neighborXPosZPos->blocks[0 + (0 * 32) + (y * 1024)] : BLOCK_AIR;
+                return neighborXPosZPos ? neighborXPosZPos->getBlock(0, y, 0) : BLOCK_AIR;
             }
-            return neighborXPos ? neighborXPos->blocks[0 + (z * 32) + (y * 1024)] : BLOCK_AIR;
+            return neighborXPos ? neighborXPos->getBlock(0, y, z) : BLOCK_AIR;
         }
         if (z < 0) {
-            return neighborZNeg ? neighborZNeg->blocks[x + (31 * 32) + (y * 1024)] : BLOCK_AIR;
+            return neighborZNeg ? neighborZNeg->getBlock(x, y, 31) : BLOCK_AIR;
         }
         if (z >= CHUNK_DEPTH) {
-            return neighborZPos ? neighborZPos->blocks[x + (0 * 32) + (y * 1024)] : BLOCK_AIR;
+            return neighborZPos ? neighborZPos->getBlock(x, y, 0) : BLOCK_AIR;
         }
 
-        return blocks[x + (z * 32) + (y * 1024)];
+        return getBlock(x, y, z);
     }
 
     static inline float GetRandomValue(int x, int z, int seed) {
@@ -192,7 +288,9 @@ public:
     }
 
     // Procedural Block Generation using scaled Perlin Noise up to 256 height
-    void generateBlocks(const Noise& noise, int seed) {
+    void generateBlocks(int seed) {
+        TraceLog(LOG_INFO, "[GEN] Chunk (%d, %d) starting generateBlocks...", pos.x, pos.z);
+        Noise noise(seed);
         int worldXOffset = pos.x * CHUNK_WIDTH;
         int worldZOffset = pos.z * CHUNK_DEPTH;
 
@@ -267,6 +365,7 @@ public:
             }
         }
         isGenerated = true;
+        TraceLog(LOG_INFO, "[GEN] Chunk (%d, %d) finished generateBlocks successfully.", pos.x, pos.z);
     }
 
     // Pack vertex attributes into a 32-bit uint (6-9-6 position mapping layout + 4-bit texture + 2-bit AO)
@@ -332,12 +431,21 @@ public:
                           const Chunk* neighborXNegZNeg, const Chunk* neighborXNegZPos,
                           const Chunk* neighborXPosZNeg, const Chunk* neighborXPosZPos) 
     {
+        TraceLog(LOG_INFO, "[MESH] Chunk (%d, %d) starting generateMeshCPU...", pos.x, pos.z);
         std::lock_guard<std::mutex> lock(meshMutex);
         subMeshes.clear();
         subMeshesTransparent.clear();
 
+        auto mBufPtr = std::make_unique<MeshingBuffers>();
+        MeshingBuffers& mBuf = *mBufPtr;
+
+        int S = lodScale.load();
+        int maxY = CHUNK_HEIGHT / S;
+        int maxZ = CHUNK_DEPTH / S;
+        int maxX = CHUNK_WIDTH / S;
+
         auto isVoxelSolid = [&](int vx, int vy, int vz) -> bool {
-            uint16_t type = getVoxel(vx, vy, vz, 
+            uint16_t type = getLODVoxel(vx, vy, vz, S,
                                      neighborXNeg, neighborXPos, 
                                      neighborZNeg, neighborZPos,
                                      neighborXNegZNeg, neighborXNegZPos,
@@ -398,15 +506,15 @@ public:
         // ==========================================
         // 1. SWEEP AXIS 1: Y-AXIS (Bottom & Top Faces)
         // ==========================================
-        for (int y = 0; y <= CHUNK_HEIGHT; ++y) {
-            for (int z = 0; z < CHUNK_DEPTH; ++z) {
-                for (int x = 0; x < CHUNK_WIDTH; ++x) {
-                    uint16_t vox_curr = getVoxel(x, y, z, 
+        for (int y = 0; y <= maxY; ++y) {
+            for (int z = 0; z < maxZ; ++z) {
+                for (int x = 0; x < maxX; ++x) {
+                    uint16_t vox_curr = getLODVoxel(x, y, z, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
                                                  neighborXPosZNeg, neighborXPosZPos);
-                    uint16_t vox_prev = getVoxel(x, y - 1, z, 
+                    uint16_t vox_prev = getLODVoxel(x, y - 1, z, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
@@ -438,7 +546,7 @@ public:
             for (int i = 0; i < mBuf.count_neg; ++i) {
                 uint16_t id = mBuf.active_neg[i];
                 uint32_t* mask = mBuf.masks_neg[id];
-                for (int z = 0; z < CHUNK_DEPTH; ++z) {
+                for (int z = 0; z < maxZ; ++z) {
                     while (mask[z] != 0) {
                         int x = countTrailingZeros(mask[z]);
                         int width = 1;
@@ -450,10 +558,10 @@ public:
                         uint32_t ao2 = getHorizontalAO(x + width, y - 1, z + height, x, z);
                         uint32_t ao3 = getHorizontalAO(x,         y - 1, z + height, x, z);
                         addQuad(
-                            x,         y, z,
-                            x + width, y, z,
-                            x + width, y, z + height,
-                            x,         y, z + height,
+                            x * S,         y * S, z * S,
+                            (x + width) * S, y * S, z * S,
+                            (x + width) * S, y * S, (z + height) * S,
+                            x * S,         y * S, (z + height) * S,
                             2, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -462,14 +570,14 @@ public:
                 }
                 mBuf.is_active_neg[id] = false;
             }
-            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, CHUNK_DEPTH);
+            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, maxZ);
             mBuf.count_neg = 0;
 
             // Greedy mesh +Y
             for (int i = 0; i < mBuf.count_pos; ++i) {
                 uint16_t id = mBuf.active_pos[i];
                 uint32_t* mask = mBuf.masks_pos[id];
-                for (int z = 0; z < CHUNK_DEPTH; ++z) {
+                for (int z = 0; z < maxZ; ++z) {
                     while (mask[z] != 0) {
                         int x = countTrailingZeros(mask[z]);
                         int width = 1;
@@ -481,10 +589,10 @@ public:
                         uint32_t ao2 = getHorizontalAO(x + width, y, z,          x, z);
                         uint32_t ao3 = getHorizontalAO(x,         y, z,          x, z);
                         addQuad(
-                            x,         y, z + height,
-                            x + width, y, z + height,
-                            x + width, y, z,
-                            x,         y, z,
+                            x * S,         y * S, (z + height) * S,
+                            (x + width) * S, y * S, (z + height) * S,
+                            (x + width) * S, y * S, z * S,
+                            x * S,         y * S, z * S,
                             3, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -493,22 +601,22 @@ public:
                 }
                 mBuf.is_active_pos[id] = false;
             }
-            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, CHUNK_DEPTH);
+            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, maxZ);
             mBuf.count_pos = 0;
         }
 
         // ==========================================
         // 2. SWEEP AXIS 0: X-AXIS (Left & Right Faces)
         // ==========================================
-        for (int x = 0; x <= CHUNK_WIDTH; ++x) {
-            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
-                for (int z = 0; z < CHUNK_DEPTH; ++z) {
-                    uint16_t vox_curr = getVoxel(x, y, z, 
+        for (int x = 0; x <= maxX; ++x) {
+            for (int y = 0; y < maxY; ++y) {
+                for (int z = 0; z < maxZ; ++z) {
+                    uint16_t vox_curr = getLODVoxel(x, y, z, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
                                                  neighborXPosZNeg, neighborXPosZPos);
-                    uint16_t vox_prev = getVoxel(x - 1, y, z, 
+                    uint16_t vox_prev = getLODVoxel(x - 1, y, z, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
@@ -540,7 +648,7 @@ public:
             for (int i = 0; i < mBuf.count_neg; ++i) {
                 uint16_t id = mBuf.active_neg[i];
                 uint32_t* mask = mBuf.masks_neg[id];
-                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                for (int y = 0; y < maxY; ++y) {
                     while (mask[y] != 0) {
                         int z = countTrailingZeros(mask[y]);
                         int width = 1;
@@ -552,10 +660,10 @@ public:
                         uint32_t ao2 = getVerticalAO_X(x - 1, y + height,     z + width,      y, z);
                         uint32_t ao3 = getVerticalAO_X(x - 1, y + height,     z,              y, z);
                         addQuad(
-                            x, y,          z,
-                            x, y,          z + width,
-                            x, y + height, z + width,
-                            x, y + height, z,
+                            x * S, y * S,          z * S,
+                            x * S, y * S,          (z + width) * S,
+                            x * S, (y + height) * S, (z + width) * S,
+                            x * S, (y + height) * S, z * S,
                             0, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -564,14 +672,14 @@ public:
                 }
                 mBuf.is_active_neg[id] = false;
             }
-            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, CHUNK_HEIGHT);
+            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, maxY);
             mBuf.count_neg = 0;
 
             // Greedy mesh +X
             for (int i = 0; i < mBuf.count_pos; ++i) {
                 uint16_t id = mBuf.active_pos[i];
                 uint32_t* mask = mBuf.masks_pos[id];
-                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                for (int y = 0; y < maxY; ++y) {
                     while (mask[y] != 0) {
                         int z = countTrailingZeros(mask[y]);
                         int width = 1;
@@ -583,10 +691,10 @@ public:
                         uint32_t ao2 = getVerticalAO_X(x, y + height,     z,              y, z);
                         uint32_t ao3 = getVerticalAO_X(x, y + height,     z + width,      y, z);
                         addQuad(
-                            x, y,          z + width,
-                            x, y,          z,
-                            x, y + height, z,
-                            x, y + height, z + width,
+                            x * S, y * S,          (z + width) * S,
+                            x * S, y * S,          z * S,
+                            x * S, (y + height) * S, z * S,
+                            x * S, (y + height) * S, (z + width) * S,
                             1, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -595,22 +703,22 @@ public:
                 }
                 mBuf.is_active_pos[id] = false;
             }
-            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, CHUNK_HEIGHT);
+            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, maxY);
             mBuf.count_pos = 0;
         }
 
         // ==========================================
         // 3. SWEEP AXIS 2: Z-AXIS (North & South Faces)
         // ==========================================
-        for (int z = 0; z <= CHUNK_DEPTH; ++z) {
-            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
-                for (int x = 0; x < CHUNK_WIDTH; ++x) {
-                    uint16_t vox_curr = getVoxel(x, y, z, 
+        for (int z = 0; z <= maxZ; ++z) {
+            for (int y = 0; y < maxY; ++y) {
+                for (int x = 0; x < maxX; ++x) {
+                    uint16_t vox_curr = getLODVoxel(x, y, z, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
                                                  neighborXPosZNeg, neighborXPosZPos);
-                    uint16_t vox_prev = getVoxel(x, y, z - 1, 
+                    uint16_t vox_prev = getLODVoxel(x, y, z - 1, S,
                                                  neighborXNeg, neighborXPos, 
                                                  neighborZNeg, neighborZPos,
                                                  neighborXNegZNeg, neighborXNegZPos,
@@ -642,7 +750,7 @@ public:
             for (int i = 0; i < mBuf.count_neg; ++i) {
                 uint16_t id = mBuf.active_neg[i];
                 uint32_t* mask = mBuf.masks_neg[id];
-                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                for (int y = 0; y < maxY; ++y) {
                     while (mask[y] != 0) {
                         int x = countTrailingZeros(mask[y]);
                         int width = 1;
@@ -654,10 +762,10 @@ public:
                         uint32_t ao2 = getVerticalAO_Z(x,         y + height,     z - 1, x, y);
                         uint32_t ao3 = getVerticalAO_Z(x + width, y + height,     z - 1, x, y);
                         addQuad(
-                            x + width, y,          z,
-                            x,         y,          z,
-                            x,         y + height, z,
-                            x + width, y + height, z,
+                            (x + width) * S, y * S,          z * S,
+                            x * S,         y * S,          z * S,
+                            x * S,         (y + height) * S, z * S,
+                            (x + width) * S, (y + height) * S, z * S,
                             4, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -666,14 +774,14 @@ public:
                 }
                 mBuf.is_active_neg[id] = false;
             }
-            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, CHUNK_HEIGHT);
+            buffersResetRow(mBuf.active_neg, mBuf.count_neg, mBuf.masks_neg, maxY);
             mBuf.count_neg = 0;
 
             // Greedy mesh +Z
             for (int i = 0; i < mBuf.count_pos; ++i) {
                 uint16_t id = mBuf.active_pos[i];
                 uint32_t* mask = mBuf.masks_pos[id];
-                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                for (int y = 0; y < maxY; ++y) {
                     while (mask[y] != 0) {
                         int x = countTrailingZeros(mask[y]);
                         int width = 1;
@@ -685,10 +793,10 @@ public:
                         uint32_t ao2 = getVerticalAO_Z(x + width, y + height,     z, x, y);
                         uint32_t ao3 = getVerticalAO_Z(x,         y + height,     z, x, y);
                         addQuad(
-                            x,         y,          z,
-                            x + width, y,          z,
-                            x + width, y + height, z,
-                            x,         y + height, z,
+                            x * S,         y * S,          z * S,
+                            (x + width) * S, y * S,          z * S,
+                            (x + width) * S, (y + height) * S, z * S,
+                            x * S,         (y + height) * S, z * S,
                             5, id,
                             ao0, ao1, ao2, ao3
                         );
@@ -697,11 +805,12 @@ public:
                 }
                 mBuf.is_active_pos[id] = false;
             }
-            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, CHUNK_HEIGHT);
+            buffersResetRow(mBuf.active_pos, mBuf.count_pos, mBuf.masks_pos, maxY);
             mBuf.count_pos = 0;
         }
 
         isMeshReadyCPU = true;
+        TraceLog(LOG_INFO, "[MESH] Chunk (%d, %d) finished generateMeshCPU successfully. Opaque meshes: %d, Transparent: %d", pos.x, pos.z, subMeshes.size(), subMeshesTransparent.size());
     }
 
     // Fast selective bitmask rows reset to avoid general 512KB memset cleanups
@@ -716,8 +825,12 @@ public:
 
     // Main thread mesh upload using OpenGL glVertexAttribIPointer for custom bit-packed buffers
     void uploadGPU(Shader customShader) {
+        TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) starting uploadGPU...", pos.x, pos.z);
         std::lock_guard<std::mutex> lock(meshMutex);
-        if (!isMeshReadyCPU || isMeshUploaded) return;
+        if (!isMeshReadyCPU || isMeshUploaded) {
+            TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) uploadGPU skipped (ready: %d, uploaded: %d)", pos.x, pos.z, isMeshReadyCPU.load(), isMeshUploaded.load());
+            return;
+        }
 
         auto uploadModelHelper = [&](Model& targetModel, std::vector<SubMesh>& targetList) {
             if (targetList.empty()) {
@@ -757,7 +870,8 @@ public:
                 mesh.vaoId = rlLoadVertexArray();
                 rlEnableVertexArray(mesh.vaoId);
 
-                mesh.vboId = (unsigned int*)RL_MALLOC(2 * sizeof(unsigned int));
+                mesh.vboId = (unsigned int*)RL_MALLOC(7 * sizeof(unsigned int));
+                std::memset(mesh.vboId, 0, 7 * sizeof(unsigned int));
                 mesh.vboId[0] = rlLoadVertexBuffer(sub.packedVertices.data(), static_cast<int>(sub.packedVertices.size() * sizeof(uint32_t)), false);
                 rlEnableVertexAttribute(0);
                 glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, 0, (void*)0);
@@ -772,6 +886,7 @@ public:
         uploadModelHelper(modelTransparent, subMeshesTransparent);
 
         isMeshUploaded = true;
+        TraceLog(LOG_INFO, "[GPU] Chunk (%d, %d) finished uploadGPU successfully. Opaque meshes: %d, Transparent: %d", pos.x, pos.z, model.meshCount, modelTransparent.meshCount);
     }
 
     void draw() {

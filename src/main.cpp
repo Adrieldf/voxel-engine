@@ -92,6 +92,7 @@ int main() {
         "flat out uint fragTextureId;\n"
         "out float fragAO;\n"
         "uniform mat4 mvp;\n"
+        "uniform float fadeProgress;\n"
         "const vec3 NORMALS[6] = vec3[6](\n"
         "    vec3(-1.0,  0.0,  0.0),\n" // 0: -X
         "    vec3( 1.0,  0.0,  0.0),\n" // 1: +X
@@ -114,7 +115,8 @@ int main() {
         "    uint cornerIdx = (inPackedData >> 24u) & 0x3u;\n"
         "    uint textureId = (inPackedData >> 26u) & 0xFu;\n"
         "    uint ao = (inPackedData >> 30u) & 0x3u;\n"
-        "    fragWorldPos = vec3(x, y, z);\n"
+        "    float offsetY = -48.0 * (1.0 - fadeProgress) * (1.0 - fadeProgress);\n"
+        "    fragWorldPos = vec3(x, y + offsetY, z);\n"
         "    fragNormal = NORMALS[normalIdx];\n"
         "    fragUV = UVS[cornerIdx];\n"
         "    fragTextureId = textureId;\n"
@@ -130,6 +132,7 @@ int main() {
         "flat in uint fragTextureId;\n"
         "in float fragAO;\n"
         "out vec4 finalColor;\n"
+        "uniform float fadeProgress;\n"
         "const vec4 BLOCK_COLORS[9] = vec4[9](\n"
         "    vec4(0.0, 0.0, 0.0, 0.0),\n"
         "    vec4(0.18, 0.72, 0.45, 1.0),\n"
@@ -147,7 +150,14 @@ int main() {
         "    if (abs(normal.x) > 0.1) return 0.8;\n"
         "    return 0.9;\n"
         "}\n"
+        "float dither(vec2 pos) {\n"
+        "    return fract(sin(dot(pos.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
+        "}\n"
         "void main() {\n"
+        "    if (fadeProgress < 0.999) {\n"
+        "        vec2 screenPos = gl_FragCoord.xy;\n"
+        "        if (dither(screenPos) > fadeProgress) discard;\n"
+        "    }\n"
         "    uint type = fragTextureId;\n"
         "    if (type >= 9u) {\n"
         "        finalColor = vec4(1.0, 0.0, 1.0, 1.0);\n"
@@ -219,8 +229,9 @@ int main() {
                 rlSetMatrixProjection(customProj);
             }
 
-            // Draw world terrain with custom shader
-            world->draw(flyCam->camera.position, voxelShader);
+            // Draw world terrain with custom shader (with view cone frustum culling)
+            Vector3 camForward = Vector3Normalize(Vector3Subtract(flyCam->camera.target, flyCam->camera.position));
+            world->draw(flyCam->camera.position, camForward, voxelShader);
 
             // Draw a subtle coordinate grid at the sea level to emphasize depth
             DrawGrid(20, 16.0f);

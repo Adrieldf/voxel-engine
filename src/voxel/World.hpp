@@ -9,6 +9,7 @@
 #include <atomic>
 #include <vector>
 #include <cmath>
+#include <thread>
 
 class World {
 public:
@@ -16,7 +17,6 @@ public:
     std::mutex chunksMutex;
     
     // Noise and Seeding
-    Noise noise;
     std::atomic<int> seed{1337};
     std::atomic<int> currentWorldId{0};
 
@@ -40,6 +40,7 @@ public:
     }
 
     void clearWorld() {
+        TraceLog(LOG_INFO, "[WORLD] Starting clearWorld(). Active tasks: %d, Chunks size: %d", activeTasks.load(), chunks.size());
         currentWorldId++; // Invalidate all pending background tasks immediately
         
         std::lock_guard<std::mutex> lock(chunksMutex);
@@ -50,12 +51,13 @@ public:
         
         std::lock_guard<std::mutex> uploadLock(uploadQueueMutex);
         uploadQueue.clear();
+        TraceLog(LOG_INFO, "[WORLD] Finished clearWorld() successfully.");
     }
 
     void recreate(int newSeed) {
-        seed = newSeed;
+        TraceLog(LOG_INFO, "[WORLD] recreate() triggered with new seed: %d", newSeed);
         clearWorld();
-        noise.reseed(newSeed);
+        seed = newSeed;
     }
 
     std::shared_ptr<Chunk> getChunk(int cx, int cz) {
@@ -90,6 +92,7 @@ public:
                     chunks[pos] = chunk;
 
                     // Enqueue block generation in the thread pool
+                    TraceLog(LOG_INFO, "[WORLD] Enqueuing generateBlocks for Chunk (%d, %d)", cx, cz);
                     activeTasks++;
                     threadPool->enqueue([this, chunk, worldId]() {
                         if (worldId != currentWorldId.load()) {
@@ -97,9 +100,39 @@ public:
                             return;
                         }
 
-                        chunk->generateBlocks(noise, seed.load());
+                        chunk->generateBlocks(seed.load());
                         activeTasks--;
                     });
+                }
+            }
+        }
+
+        // 1.5 Dynamic LOD Assignment & Re-meshing Trigger
+        {
+            std::lock_guard<std::mutex> lock(chunksMutex);
+            for (auto& pair : chunks) {
+                auto& chunk = pair.second;
+                int dx = std::abs(chunk->pos.x - px);
+                int dz = std::abs(chunk->pos.z - pz);
+                int dist = std::max(dx, dz);
+                
+                int targetScale = 1;
+                if (dist > 32) {
+                    targetScale = 4; // LOD 2 (4x4x4 downsampling)
+                } else if (dist > 16) {
+                    targetScale = 2; // LOD 1 (2x2x2 downsampling)
+                }
+                
+                // If LOD changed and chunk is fully generated, trigger a dynamic re-mesh!
+                if (chunk->lodScale.load() != targetScale) {
+                    chunk->lodScale = targetScale;
+                    if (chunk->isGenerated) {
+                        // Double-buffered hot-swapping: do not unload the old VRAM mesh yet to keep it rendering,
+                        // but set the needsReupload flag so the scheduler enqueues a new LOD mesh build!
+                        chunk->needsReupload = true;
+                        chunk->isMeshReadyCPU = false;
+                        chunk->isMeshQueued = false;
+                    }
                 }
             }
         }
@@ -109,7 +142,8 @@ public:
             std::lock_guard<std::mutex> lock(chunksMutex);
             for (auto& pair : chunks) {
                 auto& chunk = pair.second;
-                if (chunk->isGenerated && !chunk->isMeshQueued && !chunk->isMeshReadyCPU && !chunk->isMeshUploaded) {
+                bool wantsMesh = (!chunk->isMeshReadyCPU && !chunk->isMeshUploaded) || chunk->needsReupload.load();
+                if (chunk->isGenerated && !chunk->isMeshQueued && wantsMesh) {
                     
                     // Retrieve neighbors (4 cardinals + 4 diagonals)
                     auto nXNeg = chunks.find({chunk->pos.x - 1, chunk->pos.z});
@@ -143,6 +177,7 @@ public:
                         auto nXPosZNegPtr = nXPosZNeg->second;
                         auto nXPosZPosPtr = nXPosZPos->second;
 
+                        TraceLog(LOG_INFO, "[WORLD] Enqueuing generateMeshCPU for Chunk (%d, %d)", chunk->pos.x, chunk->pos.z);
                         activeTasks++;
                         threadPool->enqueue([this, chunk, nXNegPtr, nXPosPtr, nZNegPtr, nZPosPtr, 
                                              nXNegZNegPtr, nXNegZPosPtr, nXPosZNegPtr, nXPosZPosPtr, worldId]() {
@@ -153,6 +188,7 @@ public:
 
                             chunk->generateMeshCPU(nXNegPtr.get(), nXPosPtr.get(), nZNegPtr.get(), nZPosPtr.get(),
                                                    nXNegZNegPtr.get(), nXNegZPosPtr.get(), nXPosZNegPtr.get(), nXPosZPosPtr.get());
+                            chunk->isMeshQueued = false;
                             activeTasks--;
                         });
                     }
@@ -160,7 +196,7 @@ public:
             }
         }
 
-        // 3. Unload chunks that are too far away to reclaim RAM and GPU VRAM
+        // 3. Unload chunks that are too far away to reclaim RAM and GPU VRAM (Amortized to prevent frame stutters)
         std::vector<ChunkPos> toUnload;
         {
             std::lock_guard<std::mutex> lock(chunksMutex);
@@ -171,16 +207,45 @@ public:
                     toUnload.push_back(pair.first);
                 }
             }
+            int unloadCount = 0;
+            int maxUnloadsPerFrame = 4;
             for (const auto& pos : toUnload) {
+                if (unloadCount >= maxUnloadsPerFrame) break;
+                TraceLog(LOG_INFO, "[WORLD] Evicting out-of-bounds Chunk (%d, %d)", pos.x, pos.z);
                 chunks[pos]->unloadGPU();
                 chunks.erase(pos);
             }
         }
+
+        // 4. Update chunk fade-in progress (transition finishes in ~0.33s for high visual feedback)
+        {
+            std::lock_guard<std::mutex> lock(chunksMutex);
+            for (auto& pair : chunks) {
+                auto& chunk = pair.second;
+                if (chunk->isMeshUploaded) {
+                    if (chunk->fadeProgress < 1.0f) {
+                        chunk->fadeProgress += dt * 3.0f;
+                        if (chunk->fadeProgress > 1.0f) {
+                            chunk->fadeProgress = 1.0f;
+                            chunk->hasFadedIn = true;
+                        }
+                    }
+                } else {
+                    if (!chunk->hasFadedIn) {
+                        chunk->fadeProgress = 0.0f;
+                    } else {
+                        chunk->fadeProgress = 1.0f; // Keep fully visible if LOD scales are switching!
+                    }
+                }
+            }
+        }
     }
 
-    void draw(Vector3 playerPos, Shader voxelShader) {
+    void draw(Vector3 playerPos, Vector3 cameraForward, Shader voxelShader) {
         int px = static_cast<int>(std::floor(playerPos.x / CHUNK_WIDTH));
         int pz = static_cast<int>(std::floor(playerPos.z / CHUNK_DEPTH));
+
+        int fadeLoc = GetShaderLocation(voxelShader, "fadeProgress");
 
         std::lock_guard<std::mutex> lock(chunksMutex);
         
@@ -190,10 +255,36 @@ public:
             int dx = std::abs(pair.first.x - px);
             int dz = std::abs(pair.first.z - pz);
             if (dx <= renderDistance && dz <= renderDistance) {
-                // If the CPU mesh is ready but not uploaded, upload it on the main thread!
-                if (chunk->isMeshReadyCPU && !chunk->isMeshUploaded) {
+                // View Cone Bounding Sphere Culling
+                Vector3 chunkCenter = {
+                    (chunk->pos.x + 0.5f) * CHUNK_WIDTH,
+                    128.0f,
+                    (chunk->pos.z + 0.5f) * CHUNK_DEPTH
+                };
+                Vector3 toChunk = Vector3Subtract(chunkCenter, playerPos);
+                float dist = Vector3Length(toChunk);
+                if (dist > 64.0f) {
+                    Vector3 dir = Vector3Scale(toChunk, 1.0f / dist);
+                    float dot = Vector3DotProduct(cameraForward, dir);
+                    
+                    float dotThreshold = 0.2f;
+                    float lookUpDown = std::abs(cameraForward.y);
+                    dotThreshold -= lookUpDown * 0.15f; // lower threshold when looking up/down to keep wide angles visible
+                    
+                    if (dot < dotThreshold) {
+                        continue; // Culled!
+                    }
+                }
+
+                // If the CPU mesh is ready but not uploaded (or needs reupload), upload it on the main thread!
+                if (chunk->isMeshReadyCPU && (!chunk->isMeshUploaded || chunk->needsReupload.load())) {
+                    if (chunk->needsReupload.load()) {
+                        chunk->unloadGPU();
+                        chunk->needsReupload = false;
+                    }
                     chunk->uploadGPU(voxelShader);
                 }
+                SetShaderValue(voxelShader, fadeLoc, &chunk->fadeProgress, SHADER_UNIFORM_FLOAT);
                 chunk->draw();
             }
         }
@@ -205,6 +296,28 @@ public:
             int dx = std::abs(pair.first.x - px);
             int dz = std::abs(pair.first.z - pz);
             if (dx <= renderDistance && dz <= renderDistance) {
+                // View Cone Bounding Sphere Culling
+                Vector3 chunkCenter = {
+                    (chunk->pos.x + 0.5f) * CHUNK_WIDTH,
+                    128.0f,
+                    (chunk->pos.z + 0.5f) * CHUNK_DEPTH
+                };
+                Vector3 toChunk = Vector3Subtract(chunkCenter, playerPos);
+                float dist = Vector3Length(toChunk);
+                if (dist > 64.0f) {
+                    Vector3 dir = Vector3Scale(toChunk, 1.0f / dist);
+                    float dot = Vector3DotProduct(cameraForward, dir);
+                    
+                    float dotThreshold = 0.2f;
+                    float lookUpDown = std::abs(cameraForward.y);
+                    dotThreshold -= lookUpDown * 0.15f; // lower threshold when looking up/down to keep wide angles visible
+                    
+                    if (dot < dotThreshold) {
+                        continue; // Culled!
+                    }
+                }
+
+                SetShaderValue(voxelShader, fadeLoc, &chunk->fadeProgress, SHADER_UNIFORM_FLOAT);
                 chunk->drawTransparent();
             }
         }

@@ -11,8 +11,8 @@ public:
     float pitch;
     
     // Movement configurations
-    float maxSpeed = 30.0f;
-    float acceleration = 60.0f;
+    float maxSpeed = 500.0f;
+    float acceleration = 1000.0f;
     float damping = 8.0f;
     float mouseSensitivity = 0.15f;
 
@@ -40,10 +40,10 @@ public:
         // Adjust camera velocity/speed with mouse scroll wheel
         float wheel = GetMouseWheelMove();
         if (std::abs(wheel) > 0.001f) {
-            // Dynamic scroll step for effortless scrolling between 3 and 500 m/s
+            // Dynamic scroll step for effortless scrolling between 3 and 1000 m/s
             maxSpeed += wheel * (maxSpeed * 0.15f + 2.0f);
             if (maxSpeed < 3.0f) maxSpeed = 3.0f;
-            if (maxSpeed > 500.0f) maxSpeed = 500.0f;
+            if (maxSpeed > 1000.0f) maxSpeed = 1000.0f;
             
             // Adjust acceleration proportionally so handling remains snappy
             acceleration = maxSpeed * 2.0f;
@@ -65,7 +65,7 @@ public:
         // Process mouse look rotation only when cursor is disabled
         if (isCursorLocked) {
             Vector2 mouseDelta = GetMouseDelta();
-            targetYaw += mouseDelta.x * mouseSensitivity * DEG2RAD * 0.5f;
+            targetYaw -= mouseDelta.x * mouseSensitivity * DEG2RAD * 0.5f;
             targetPitch -= mouseDelta.y * mouseSensitivity * DEG2RAD * 0.5f;
 
             // Clamp pitch to avoid flips [-89, 89] degrees

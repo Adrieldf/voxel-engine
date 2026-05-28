@@ -46,11 +46,15 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Build successful!" -ForegroundColor Green
 Write-Host "==============================================" -ForegroundColor Cyan
 
-# Run the executable
-$EXE_PATH = "build\Release\VoxelEngine.exe"
-if (Test-Path $EXE_PATH) {
-    Write-Host "Launching Voxel Engine..." -ForegroundColor Yellow
-    & $EXE_PATH
+# Run the executable unless -norun is specified
+if ($args -contains "-norun") {
+    Write-Host "Compilation complete. Skipping launch due to -norun parameter." -ForegroundColor Yellow
 } else {
-    Write-Host "Executable not found at: $EXE_PATH" -ForegroundColor Red
+    $EXE_PATH = "build\Release\VoxelEngine.exe"
+    if (Test-Path $EXE_PATH) {
+        Write-Host "Launching Voxel Engine..." -ForegroundColor Yellow
+        & $EXE_PATH
+    } else {
+        Write-Host "Executable not found at: $EXE_PATH" -ForegroundColor Red
+    }
 }
