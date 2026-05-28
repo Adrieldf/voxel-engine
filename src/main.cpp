@@ -11,6 +11,8 @@ extern "C" {
 #include "rlgl.h"
 #include "camera/Camera.hpp"
 #include "voxel/World.hpp"
+#include "core/Noise.hpp"
+#include "environment/Environment.hpp"
 #include <string>
 #include <memory>
 #include <random>
@@ -181,6 +183,7 @@ int main() {
     // Generate initial world with seed 1337
     int seedValue = 1337;
     world->recreate(seedValue);
+    Noise cloudNoise(static_cast<unsigned int>(seedValue));
 
     // Position player safely above grand ground level (surface is around y=130)
     auto flyCam = std::make_unique<FlyCamera>(Vector3{ 16.0f, 150.0f, 16.0f });
@@ -222,12 +225,15 @@ int main() {
                 rlSetMatrixProjection(customProj);
             }
 
+            // Draw skybox with smooth atmospheric vertical color gradient
+            DrawSkybox(flyCam->camera.position);
+
             // Draw world terrain with custom shader (with view cone frustum culling)
             Vector3 camForward = Vector3Normalize(Vector3Subtract(flyCam->camera.target, flyCam->camera.position));
             world->draw(flyCam->camera.position, camForward, voxelShader);
 
-            // Draw a subtle coordinate grid at the sea level to emphasize depth
-            DrawGrid(20, 16.0f);
+            // Draw infinite procedural drifting clouds
+            DrawClouds(flyCam->camera.position, camForward, cloudNoise, dt);
 
         EndMode3D();
 
@@ -289,31 +295,38 @@ int main() {
         if (DrawButton(btnDec, "- 1", Color{ 30, 36, 48, 200 }, Color{ 45, 54, 72, 255 }, Color{ 255, 255, 255, 20 }, WHITE)) {
             seedValue--;
             world->recreate(seedValue);
+            cloudNoise.reseed(static_cast<unsigned int>(seedValue));
         }
 
         if (DrawButton(btnInc, "+ 1", Color{ 30, 36, 48, 200 }, Color{ 45, 54, 72, 255 }, Color{ 255, 255, 255, 20 }, WHITE)) {
             seedValue++;
             world->recreate(seedValue);
+            cloudNoise.reseed(static_cast<unsigned int>(seedValue));
         }
 
         if (DrawButton(btnRand, "Random Seed", Color{ 30, 36, 48, 200 }, Color{ 46, 184, 114, 180 }, Color{ 46, 184, 114, 80 }, WHITE)) {
             std::uniform_int_distribution<int> dist(1, 999999);
             seedValue = dist(randEngine);
             world->recreate(seedValue);
+            cloudNoise.reseed(static_cast<unsigned int>(seedValue));
         }
 
-        // View Distance Slider (Throttle updates by committing only on mouse button release)
+        // View Distance Slider (Updated dynamically for instant responsiveness)
         static float sliderViewDistance = 16.0f;
         Rectangle sliderRect = { hudPanel.x + 25, static_cast<float>(seedStartY + 130), 270.0f, 15.0f };
         DrawSlider(sliderRect, "View Distance (Chunks)", sliderViewDistance, 3.0f, 64.0f, Color{ 30, 36, 48, 200 }, Color{ 46, 184, 114, 255 }, Color{ 110, 130, 160, 255 });
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            world->renderDistance = static_cast<int>(sliderViewDistance);
+        
+        int targetDist = static_cast<int>(sliderViewDistance);
+        if (world->renderDistance != targetDist) {
+            world->renderDistance = targetDist;
+            TraceLog(LOG_INFO, "[MAIN] Render distance dynamically updated to: %d", targetDist);
         }
 
         // Recreate World button (styled in signature green)
         Rectangle btnRebuild = { hudPanel.x + 25, static_cast<float>(seedStartY + 165), 270.0f, 40.0f };
         if (DrawButton(btnRebuild, "Recreate Terrain", Color{ 46, 184, 114, 200 }, Color{ 58, 204, 131, 255 }, Color{ 255, 255, 255, 30 }, WHITE)) {
             world->recreate(seedValue);
+            cloudNoise.reseed(static_cast<unsigned int>(seedValue));
         }
 
         DrawLine(static_cast<int>(hudPanel.x + 25), static_cast<int>(hudPanel.y + 490), static_cast<int>(hudPanel.x + 295), static_cast<int>(hudPanel.y + 490), Color{ 255, 255, 255, 25 });

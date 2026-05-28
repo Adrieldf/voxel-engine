@@ -150,95 +150,20 @@ public:
         }
     }
 
-    BlockType getLODBlock(int vx, int vy, int vz, int scale) const {
-        if (scale <= 1) {
-            return getBlock(vx, vy, vz);
-        }
-        
-        int x_start = vx * scale;
-        int y_start = vy * scale;
-        int z_start = vz * scale;
-        
-        int counts[16] = {0};
-        int maxCount = 0;
-        BlockType dominantType = BLOCK_AIR;
-        
-        for (int dy = 0; dy < scale; ++dy) {
-            for (int dx = 0; dx < scale; ++dx) {
-                for (int dz = 0; dz < scale; ++dz) {
-                    BlockType type = getBlock(x_start + dx, y_start + dy, z_start + dz);
-                    if (type > BLOCK_AIR && type < BLOCK_COUNT) {
-                        counts[type]++;
-                        if (counts[type] > maxCount) {
-                            maxCount = counts[type];
-                            dominantType = type;
-                        }
-                    }
-                }
-            }
-        }
-        return dominantType;
+    BlockType getLODBlock(int vx, int vy, int vz, int /*scale*/) const {
+        // LOD system is fully disabled; always return the full-resolution block
+        return getBlock(vx, vy, vz);
     }
 
-    inline uint16_t getLODVoxel(int vx, int vy, int vz, int scale,
+    inline uint16_t getLODVoxel(int vx, int vy, int vz, int /*scale*/,
                                 const Chunk* neighborXNeg, const Chunk* neighborXPos,
                                 const Chunk* neighborZNeg, const Chunk* neighborZPos,
                                 const Chunk* neighborXNegZNeg, const Chunk* neighborXNegZPos,
                                 const Chunk* neighborXPosZNeg, const Chunk* neighborXPosZPos) const 
     {
-        if (scale <= 1) {
-            return getVoxel(vx, vy, vz, neighborXNeg, neighborXPos, neighborZNeg, neighborZPos,
-                            neighborXNegZNeg, neighborXNegZPos, neighborXPosZNeg, neighborXPosZPos);
-        }
-
-        int rx = vx * scale;
-        int ry = vy * scale;
-        int rz = vz * scale;
-
-        if (ry < 0 || ry >= CHUNK_HEIGHT) return BLOCK_AIR;
-
-        if (rx < 0 || rx >= CHUNK_WIDTH || rz < 0 || rz >= CHUNK_DEPTH) {
-            const Chunk* targetNeighbor = nullptr;
-            int nx = rx;
-            int nz = rz;
-
-            if (rx < 0) {
-                nx += CHUNK_WIDTH;
-                if (rz < 0) {
-                    targetNeighbor = neighborXNegZNeg;
-                    nz += CHUNK_DEPTH;
-                } else if (rz >= CHUNK_DEPTH) {
-                    targetNeighbor = neighborXNegZPos;
-                    nz -= CHUNK_DEPTH;
-                } else {
-                    targetNeighbor = neighborXNeg;
-                }
-            } else if (rx >= CHUNK_WIDTH) {
-                nx -= CHUNK_WIDTH;
-                if (rz < 0) {
-                    targetNeighbor = neighborXPosZNeg;
-                    nz += CHUNK_DEPTH;
-                } else if (rz >= CHUNK_DEPTH) {
-                    targetNeighbor = neighborXPosZPos;
-                    nz -= CHUNK_DEPTH;
-                } else {
-                    targetNeighbor = neighborXPos;
-                }
-            } else {
-                if (rz < 0) {
-                    targetNeighbor = neighborZNeg;
-                    nz += CHUNK_DEPTH;
-                } else if (rz >= CHUNK_DEPTH) {
-                    targetNeighbor = neighborZPos;
-                    nz -= CHUNK_DEPTH;
-                }
-            }
-
-            if (!targetNeighbor) return BLOCK_AIR;
-            return targetNeighbor->getLODBlock(nx / scale, ry / scale, nz / scale, scale);
-        }
-
-        return getLODBlock(vx, vy, vz, scale);
+        // LOD system is fully disabled; always return the full-resolution voxel
+        return getVoxel(vx, vy, vz, neighborXNeg, neighborXPos, neighborZNeg, neighborZPos,
+                        neighborXNegZNeg, neighborXNegZPos, neighborXPosZNeg, neighborXPosZPos);
     }
 
     inline uint16_t getVoxel(int x, int y, int z,
@@ -439,10 +364,10 @@ public:
         auto mBufPtr = std::make_unique<MeshingBuffers>();
         MeshingBuffers& mBuf = *mBufPtr;
 
-        int S = lodScale.load();
-        int maxY = CHUNK_HEIGHT / S;
-        int maxZ = CHUNK_DEPTH / S;
-        int maxX = CHUNK_WIDTH / S;
+        int S = 1; // LOD system is disabled; chunks are always rendered at full scale 1
+        int maxY = CHUNK_HEIGHT;
+        int maxZ = CHUNK_DEPTH;
+        int maxX = CHUNK_WIDTH;
 
         auto isVoxelSolid = [&](int vx, int vy, int vz) -> bool {
             uint16_t type = getLODVoxel(vx, vy, vz, S,
