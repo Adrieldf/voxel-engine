@@ -25,7 +25,7 @@ public:
     std::atomic<int> activeTasks{0};
 
     // Configuration
-    int renderDistance = 6;  // Render radius in chunks (16 blocks each)
+    int renderDistance = 16;  // Render radius in chunks (16 blocks each)
     
     // Safe queue of chunks to be uploaded on the main thread
     std::vector<std::shared_ptr<Chunk>> uploadQueue;

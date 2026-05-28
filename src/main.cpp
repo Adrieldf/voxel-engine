@@ -150,14 +150,7 @@ int main() {
         "    if (abs(normal.x) > 0.1) return 0.8;\n"
         "    return 0.9;\n"
         "}\n"
-        "float dither(vec2 pos) {\n"
-        "    return fract(sin(dot(pos.xy, vec2(12.9898, 78.233))) * 43758.5453);\n"
-        "}\n"
         "void main() {\n"
-        "    if (fadeProgress < 0.999) {\n"
-        "        vec2 screenPos = gl_FragCoord.xy;\n"
-        "        if (dither(screenPos) > fadeProgress) discard;\n"
-        "    }\n"
         "    uint type = fragTextureId;\n"
         "    if (type >= 9u) {\n"
         "        finalColor = vec4(1.0, 0.0, 1.0, 1.0);\n"
@@ -310,7 +303,7 @@ int main() {
         }
 
         // View Distance Slider (Throttle updates by committing only on mouse button release)
-        static float sliderViewDistance = 6.0f;
+        static float sliderViewDistance = 16.0f;
         Rectangle sliderRect = { hudPanel.x + 25, static_cast<float>(seedStartY + 130), 270.0f, 15.0f };
         DrawSlider(sliderRect, "View Distance (Chunks)", sliderViewDistance, 3.0f, 64.0f, Color{ 30, 36, 48, 200 }, Color{ 46, 184, 114, 255 }, Color{ 110, 130, 160, 255 });
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
